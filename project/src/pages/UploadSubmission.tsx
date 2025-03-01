@@ -7,35 +7,51 @@ import Card from '../components/Card';
 import Button from '../components/Button';
 import { Upload, FileText, AlertCircle, CheckCircle, X } from 'lucide-react';
 
+interface SubmissionResult {
+  f1_score: number;
+  accuracy: number;
+  timestamp: string;
+  uploadsRemaining: number;
+}
+
 const UploadSubmission: React.FC = () => {
   const { token } = useAuth();
   const [file, setFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
-  const [result, setResult] = useState<{
-    f1_score: number;
-    accuracy: number;
-    timestamp: string;
-    uploadsRemaining: number;
-  } | null>(null);
+  const [result, setResult] = useState<SubmissionResult | null>(null);
   const [requiredRowCount, setRequiredRowCount] = useState<number>(0);
   const [csvPreview, setCsvPreview] = useState<string[]>([]);
+  const [uploadsRemaining, setUploadsRemaining] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    const fetchRowCount = async () => {
+    const fetchRequirements = async () => {
       try {
-        const response = await axios.get(`${API_URL}/row-count`);
-        setRequiredRowCount(response.data.rowCount);
+        // Fetch row count requirement
+        const rowCountResponse = await axios.get(`${API_URL}/row-count`, {
+          headers: {
+            Authorization: `Bearer ${token}`
+          }
+        });
+        setRequiredRowCount(rowCountResponse.data.rowCount);
+        
+        // Fetch user's remaining upload count
+        const uploadsResponse = await axios.get(`${API_URL}/uploads-remaining`, {
+          headers: {
+            Authorization: `Bearer ${token}`
+          }
+        });
+        setUploadsRemaining(uploadsResponse.data.uploadsRemaining);
       } catch (error) {
-        console.error('Error fetching row count:', error);
+        console.error('Error fetching submission requirements:', error);
         toast.error('Failed to load submission requirements');
       }
     };
     
-    fetchRowCount();
-  }, []);
+    fetchRequirements();
+  }, [token]);
 
   const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -80,7 +96,16 @@ const UploadSubmission: React.FC = () => {
     const reader = new FileReader();
     reader.onload = (e) => {
       const text = e.target?.result?.toString() || '';
-      setCsvPreview(text.split('\n').slice(0, 5));
+      const rows = text.split('\n').slice(0, 5);
+      setCsvPreview(rows);
+      
+      // Basic validation for required columns
+      if (rows.length > 0) {
+        const headers = rows[0].toLowerCase();
+        if (!headers.includes('isfraud') && !headers.includes('fraudlabel')) {
+          toast.error('CSV must contain a column named "isFraud" or "FraudLabel"');
+        }
+      }
     };
     reader.readAsText(file);
     
@@ -115,14 +140,25 @@ const UploadSubmission: React.FC = () => {
       });
       
       setResult(response.data);
+      setUploadsRemaining(response.data.uploadsRemaining);
       toast.success('File uploaded successfully!');
     } catch (error: any) {
       console.error('Upload error:', error);
       const serverError = error.response?.data;
-      const errorMessage = serverError?.details 
-        ? `${serverError.error}: ${serverError.details}`
-        : 'Upload failed. Please check file format and try again.';
-      toast.error(errorMessage);
+      
+      // Handle rate limit (429) error specifically
+      if (error.response?.status === 429) {
+        const nextReset = serverError.nextReset ? 
+          new Date(serverError.nextReset).toLocaleTimeString() : 
+          'tomorrow';
+        toast.error(`Daily upload limit exceeded. Limit resets at ${nextReset}`);
+      } else {
+        // Handle other errors
+        const errorMessage = serverError?.details 
+          ? `${serverError.error}: ${serverError.details}`
+          : 'Upload failed. Please check file format and try again.';
+        toast.error(errorMessage);
+      }
     } finally {
       setIsUploading(false);
     }
@@ -130,6 +166,7 @@ const UploadSubmission: React.FC = () => {
 
   const handleRemoveFile = () => {
     setFile(null);
+    setCsvPreview([]);
     setResult(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
@@ -137,169 +174,133 @@ const UploadSubmission: React.FC = () => {
   };
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold text-gray-900">Upload Submission</h1>
-      <p className="text-gray-600">Upload your CSV file with predictions to evaluate your model</p>
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <Card>
-          <div
-            className={`border-2 border-dashed rounded-lg p-6 flex flex-col items-center justify-center h-64 transition-colors ${
-              isDragging
-                ? 'border-indigo-500 bg-indigo-50'
-                : file
-                ? 'border-green-500 bg-green-50'
-                : 'border-gray-300 hover:border-indigo-400'
-            }`}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-          >
-            {file ? (
-              <div className="flex flex-col items-center">
-                <FileText className="h-12 w-12 text-green-500 mb-2" />
-                <p className="text-sm font-medium text-gray-900">{file.name}</p>
-                <p className="text-xs text-gray-500 mb-4">
-                  {(file.size / 1024).toFixed(2)} KB
-                </p>
-                <div className="flex space-x-2">
-                  <Button
-                    variant="danger"
-                    size="sm"
-                    onClick={handleRemoveFile}
-                  >
-                    <X className="h-4 w-4 mr-1" />
-                    Remove
-                  </Button>
-                  <Button
-                    variant="primary"
-                    size="sm"
-                    onClick={handleUpload}
-                    isLoading={isUploading}
-                    disabled={isUploading}
-                  >
-                    <Upload className="h-4 w-4 mr-1" />
-                    {isUploading ? 'Uploading...' : 'Upload'}
-                  </Button>
-                </div>
-              </div>
-            ) : (
-              <>
-                <Upload className="h-12 w-12 text-gray-400 mb-2" />
-                <p className="text-sm font-medium text-gray-900">
-                  Drag and drop your CSV file here
-                </p>
-                <p className="text-xs text-gray-500 mb-4">
-                  or click to browse files (max 5MB)
-                </p>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  Browse Files
-                </Button>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".csv"
-                  onChange={handleFileChange}
-                  className="hidden"
-                />
-              </>
-            )}
-          </div>
-
-          {isUploading && (
-            <div className="mt-4">
-              <div className="flex justify-between text-sm text-gray-600 mb-1">
-                <span>Uploading...</span>
-                <span>{uploadProgress}%</span>
-              </div>
-              <div className="w-full bg-gray-200 rounded-full h-2">
-                <div
-                  className="bg-indigo-600 h-2 rounded-full"
-                  style={{ width: `${uploadProgress}%` }}
-                ></div>
-              </div>
-            </div>
+    <div className="max-w-4xl mx-auto p-4">
+      <h1 className="text-2xl font-bold mb-4">Submit Fraud Prediction Model</h1>
+      
+      {/* Submission Info */}
+      <Card className="mb-6 p-4">
+        <h2 className="font-semibold text-lg mb-2">Submission Requirements</h2>
+        <ul className="list-disc pl-5 mb-4">
+          <li>Upload a CSV file with predictions (0 or 1) for each transaction</li>
+          <li>Required column: <code>isFraud</code> or <code>FraudLabel</code></li>
+          {requiredRowCount > 0 && (
+            <li>File must contain exactly {requiredRowCount} rows</li>
           )}
-
-          {file && (
-            <div className="mt-4">
-              <p className="text-sm font-medium text-gray-700 mb-2">CSV Preview (first 5 rows):</p>
-              <div className="bg-gray-50 p-3 rounded-md font-mono text-sm">
-                {csvPreview.map((line, index) => (
-                  <div key={index} className="text-gray-600">{line}</div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          <div className="mt-4 bg-yellow-50 border border-yellow-200 rounded-md p-3">
-            <div className="flex">
-              <AlertCircle className="h-5 w-5 text-yellow-500 mr-2" />
-              <div className="text-sm text-yellow-700">
-                <p className="font-medium">Required CSV Format:</p>
-                <ul className="list-disc list-inside mt-1 space-y-1">
-                  <li>Single column with header <code>FraudLabel</code> (case-sensitive)</li>
-                  <li>Binary values (0 or 1) only</li>
-                  <li>No empty rows or additional columns</li>
-                  <li>Exactly {requiredRowCount} rows matching test set</li>
-                  <li>CSV encoding: UTF-8</li>
-                </ul>
-              </div>
-            </div>
+          <li>File size limit: 5MB</li>
+        </ul>
+        {uploadsRemaining !== null && (
+          <div className="text-sm mt-2">
+            <p>Uploads remaining today: <span className="font-medium">{uploadsRemaining}</span></p>
           </div>
-        </Card>
-
-        <Card title="Submission Results">
-          {result ? (
-            <div className="space-y-4">
-              <div className="flex items-center justify-center mb-4">
-                <CheckCircle className="h-12 w-12 text-green-500" />
-              </div>
-              
-              <div className="grid grid-cols-2 gap-4">
-                <div className="bg-indigo-50 p-4 rounded-lg">
-                  <p className="text-sm text-indigo-700 font-medium">F1 Score</p>
-                  <p className="text-2xl font-bold text-indigo-900">
-                    {result.f1_score.toFixed(4)}
-                  </p>
-                </div>
-                
-                <div className="bg-green-50 p-4 rounded-lg">
-                  <p className="text-sm text-green-700 font-medium">Accuracy</p>
-                  <p className="text-2xl font-bold text-green-900">
-                    {result.accuracy.toFixed(4)}
-                  </p>
-                </div>
-              </div>
-              
-              <div className="border-t border-gray-200 pt-4 mt-4">
-                <div className="flex justify-between text-sm">
-                  <span className="text-gray-500">Submission Time:</span>
-                  <span className="text-gray-900 font-medium">
-                    {new Date(result.timestamp).toLocaleString()}
-                  </span>
-                </div>
-                <div className="flex justify-between text-sm mt-2">
-                  <span className="text-gray-500">Uploads Remaining Today:</span>
-                  <span className="text-gray-900 font-medium">
-                    {result.uploadsRemaining}
-                  </span>
-                </div>
-              </div>
-            </div>
+        )}
+      </Card>
+      
+      {/* File Upload */}
+      <Card className="mb-6">
+        <div 
+          className={`border-2 border-dashed rounded-lg p-8 text-center ${
+            isDragging ? 'border-blue-500 bg-blue-50' : 'border-gray-300'
+          }`}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
+          {!file ? (
+            <>
+              <Upload className="mx-auto h-12 w-12 text-gray-400 mb-4" />
+              <h3 className="text-lg font-medium mb-2">Drag and drop your CSV file here</h3>
+              <p className="text-sm text-gray-500 mb-4">or</p>
+              <input
+                type="file"
+                ref={fileInputRef}
+                onChange={handleFileChange}
+                accept=".csv"
+                className="hidden"
+              />
+              <Button 
+                onClick={() => fileInputRef.current?.click()}
+                variant="primary"
+              >
+                Select File
+              </Button>
+            </>
           ) : (
-            <div className="flex flex-col items-center justify-center h-64 text-gray-500">
-              <FileText className="h-12 w-12 mb-2" />
-              <p>No submission results yet</p>
-              <p className="text-sm mt-1">Upload a file to see results</p>
+            <div className="space-y-4">
+              <div className="flex items-center justify-center space-x-3">
+                <FileText className="h-8 w-8 text-blue-500" />
+                <div className="text-left">
+                  <p className="font-medium">{file.name}</p>
+                  <p className="text-sm text-gray-500">{(file.size / 1024).toFixed(1)} KB</p>
+                </div>
+                <button 
+                  onClick={handleRemoveFile}
+                  className="ml-4 text-red-500 hover:text-red-700"
+                  disabled={isUploading}
+                >
+                  <X className="h-6 w-6" />
+                </button>
+              </div>
+              
+              {csvPreview.length > 0 && (
+                <div className="bg-gray-50 rounded p-3 text-left text-sm">
+                  <p className="font-medium mb-1">File Preview (first 5 rows):</p>
+                  <pre className="overflow-x-auto">{csvPreview.join('\n')}</pre>
+                </div>
+              )}
+              
+              {!isUploading ? (
+                <Button 
+                  onClick={handleUpload}
+                  variant="primary"
+                  className="w-full"
+                  disabled={isUploading}
+                >
+                  Upload File
+                </Button>
+              ) : (
+                <div className="space-y-2">
+                  <div className="w-full bg-gray-200 rounded-full h-2.5">
+                    <div 
+                      className="bg-blue-600 h-2.5 rounded-full" 
+                      style={{ width: `${uploadProgress}%` }}
+                    ></div>
+                  </div>
+                  <p className="text-sm">{uploadProgress}% Uploaded</p>
+                </div>
+              )}
             </div>
           )}
+        </div>
+      </Card>
+      
+      {/* Results */}
+      {result && (
+        <Card className="p-4">
+          <div className="flex items-center mb-3">
+            <CheckCircle className="text-green-500 h-6 w-6 mr-2" />
+            <h2 className="text-lg font-semibold">Submission Results</h2>
+          </div>
+          
+          <div className="grid grid-cols-2 gap-4">
+            <div className="bg-gray-50 p-3 rounded">
+              <p className="text-sm text-gray-500">F1 Score</p>
+              <p className="text-xl font-bold">{(result.f1_score * 100).toFixed(2)}%</p>
+            </div>
+            <div className="bg-gray-50 p-3 rounded">
+              <p className="text-sm text-gray-500">Accuracy</p>
+              <p className="text-xl font-bold">{(result.accuracy * 100).toFixed(2)}%</p>
+            </div>
+          </div>
+          
+          <p className="mt-4 text-sm text-gray-500">
+            Submitted on {new Date(result.timestamp).toLocaleString()}
+          </p>
+          
+          <p className="mt-2 text-sm">
+            Uploads remaining today: <span className="font-medium">{result.uploadsRemaining}</span>
+          </p>
         </Card>
-      </div>
+      )}
     </div>
   );
 };

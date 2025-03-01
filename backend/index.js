@@ -179,8 +179,14 @@ const loadIdealTestData = async () => {
           results.push(row);
         })
         .on('end', () => {
-          if (!results.length || !results[0].hasOwnProperty('FraudLabel')) {
-            reject(new Error("Ideal CSV missing 'FraudLabel' column"));
+          // Check if we have any valid fraud label column
+          const firstRow = results[0] || {};
+          const hasValidColumn = Object.keys(firstRow).some(key => 
+            ['fraudlabel', 'isfraud', 'fraud'].includes(key.toLowerCase())
+          );
+          
+          if (!results.length || !hasValidColumn) {
+            reject(new Error("Ideal CSV missing fraud label column"));
             return;
           }
           console.log('Ideal test data loaded successfully');
@@ -412,10 +418,7 @@ app.post('/change-password', authenticateJWT, async (req, res) => {
   }
 });
 
-// Protected routes
-// Apply authentication to existing routes
-
-// Upload endpoint
+// FIXED Upload endpoint
 app.post('/upload', authenticateJWT, handleUpload, async (req, res) => {
   try {
     const userId = req.user.username;
@@ -442,53 +445,108 @@ app.post('/upload', authenticateJWT, handleUpload, async (req, res) => {
    
     // Parse CSV file
     const csvData = await parseCSV(req.file.buffer);
-   
-    // Validate predictions column
-    if (!csvData.length || !Object.keys(csvData[0]).some(k => k.toLowerCase() === 'fraudlabel')) {
-      return res.status(422).json({ 
-        error: "CSV must contain a 'FraudLabel' column",
-        details: "The first row should contain exactly one column named 'FraudLabel'"
-      });
-    }
-
-    // Verify only one column exists
-    if (Object.keys(csvData[0]).length !== 1) {
-      const columns = Object.keys(csvData[0]).join(', ');
-      return res.status(422).json({
-        error: "Invalid CSV format",
-        details: `Found ${Object.keys(csvData[0]).length} columns (${columns}). Must have exactly one 'FraudLabel' column`
-      });
-    }
-
-    // Extract and validate predictions
-    const predictions = [];
-    const columnKey = Object.keys(csvData[0]).find(k => k.toLowerCase() === 'fraudlabel');
     
+    if (!csvData.length) {
+      return res.status(422).json({
+        error: "Empty CSV file",
+        details: "The uploaded file contains no data"
+      });
+    }
+
+    // Check for required columns (case-insensitive)
+    const firstRow = csvData[0];
+    const columnKeys = Object.keys(firstRow);
+    
+    // Look for isFraud column (might be named differently)
+    const fraudColKey = columnKeys.find(k => k.toLowerCase() === 'isfraud' || k.toLowerCase() === 'fraudlabel');
+    
+    if (!fraudColKey) {
+      return res.status(422).json({
+        error: "Missing required column",
+        details: "CSV must contain a column named 'isFraud' or 'FraudLabel'"
+      });
+    }
+
+    // Extract transaction IDs if present (for ordering)
+    const transactionIdKey = columnKeys.find(k => k.toLowerCase() === 'transactionid');
+    const hasTransactionId = !!transactionIdKey;
+
+    // Prepare to extract predictions
+    const predictions = [];
+    const predictionMap = {};
+    
+    // Process predictions
     for (let i = 0; i < csvData.length; i++) {
-      const predVal = csvData[i][columnKey];
+      const row = csvData[i];
+      const predVal = row[fraudColKey];
       const prediction = parseInt(predVal, 10);
-     
+      
+      // Validate prediction values
       if (isNaN(prediction) || ![0, 1].includes(prediction)) {
         return res.status(422).json({
           error: `Invalid value at row ${i+1}`,
-          details: `'${predVal}' must be 0 or 1`
+          details: `Value '${predVal}' in column '${fraudColKey}' must be 0 or 1`
         });
       }
-      predictions.push(prediction);
+      
+      // If we have transaction IDs, store with mapping
+      if (hasTransactionId) {
+        const transactionId = row[transactionIdKey];
+        predictionMap[transactionId] = prediction;
+      } else {
+        // Otherwise just collect in order
+        predictions.push(prediction);
+      }
     }
-   
-    // Validate prediction length
-    if (predictions.length !== IDEAL_DF.length) {
-      return res.status(422).json({
-        error: `Row count mismatch`,
-        details: `File contains ${predictions.length} rows. Required exactly ${IDEAL_DF.length} rows matching the test set`
+    
+    // Determine ideal data fraud label column
+    const idealFraudColumn = Object.keys(IDEAL_DF[0]).find(k => 
+      ['fraudlabel', 'isfraud', 'fraud'].includes(k.toLowerCase())
+    );
+    
+    if (!idealFraudColumn) {
+      return res.status(500).json({
+        error: 'Server configuration error',
+        details: 'Could not find fraud label column in reference data'
       });
     }
-   
-    // Calculate metrics
-    const actuals = IDEAL_DF.map(row => parseInt(row.FraudLabel, 10));
-    const f1 = F1Score(actuals, predictions);
-    const accuracy = Accuracy(actuals, predictions);
+    
+    // If we have transaction IDs, order predictions to match ideal data
+    const idealTransactionIdColumn = Object.keys(IDEAL_DF[0]).find(k => 
+      k.toLowerCase() === 'transactionid'
+    );
+    
+    let orderedPredictions = [];
+    
+    if (hasTransactionId && idealTransactionIdColumn) {
+      // Match by transaction ID
+      for (const idealRow of IDEAL_DF) {
+        const transactionId = idealRow[idealTransactionIdColumn];
+        if (!predictionMap.hasOwnProperty(transactionId)) {
+          return res.status(422).json({
+            error: `Missing prediction`,
+            details: `No prediction provided for TransactionID: ${transactionId}`
+          });
+        }
+        orderedPredictions.push(predictionMap[transactionId]);
+      }
+    } else {
+      // Use the predictions as-is, but check length
+      orderedPredictions = predictions;
+    }
+    
+    // Validate prediction count matches ideal dataset
+    if (orderedPredictions.length !== IDEAL_DF.length) {
+      return res.status(422).json({
+        error: `Row count mismatch`,
+        details: `File contains ${orderedPredictions.length} predictions. Required exactly ${IDEAL_DF.length} predictions matching the test set.`
+      });
+    }
+    
+    // Calculate metrics using ideal data actuals
+    const actuals = IDEAL_DF.map(row => parseInt(row[idealFraudColumn], 10));
+    const f1 = F1Score(actuals, orderedPredictions);
+    const accuracy = Accuracy(actuals, orderedPredictions);
    
     // Store results in MongoDB
     const timestamp = new Date();
@@ -529,35 +587,58 @@ app.post('/upload', authenticateJWT, handleUpload, async (req, res) => {
   }
 });
 
-// Leaderboard endpoint - publicly accessible
+// FIXED Leaderboard endpoint - publicly accessible
 app.get('/leaderboard', async (req, res) => {
   try {
     // Get limit parameter or default to 5
     const limit = parseInt(req.query.limit, 10) || 5;
    
-    // Aggregate to get best scores per user
-    const leaderboard = await Score.aggregate([
+    // First find the best f1 score for each user
+    const bestScores = await Score.aggregate([
+      // Group by userId to find max f1 score
       { $group: {
           _id: '$userId',
-          f1_score: { $max: '$f1' },
-          accuracy: { $max: '$accuracy' },
-          latestSubmission: { $max: '$timestamp' }
+          maxF1: { $max: '$f1' },
+          entries: { $push: { f1: '$f1', accuracy: '$accuracy', timestamp: '$timestamp', _id: '$_id' } }
         }
       },
-      { $sort: { f1_score: -1, latestSubmission: 1 } }, // Sort by f1 and then by earliest submission
-      { $limit: limit },
+      // For each user, find entry with max f1 (in case of ties, take earliest)
+      { $addFields: {
+          bestEntry: {
+            $filter: {
+              input: '$entries',
+              as: 'entry',
+              cond: { $eq: ['$$entry.f1', '$maxF1'] }
+            }
+          }
+        }
+      },
+      { $addFields: {
+          // Sort entries with same F1 by timestamp (ascending)
+          sortedBestEntries: { $sortArray: { input: '$bestEntry', sortBy: { timestamp: 1 } } }
+        }
+      },
+      // Extract first entry (earliest with highest F1)
+      { $addFields: {
+          bestEntry: { $arrayElemAt: ['$sortedBestEntries', 0] }
+        }
+      },
+      // Format output
       { $project: {
           _id: 0,
           user_id: '$_id',
-          f1_score: 1,
-          accuracy: 1,
-          last_submission: '$latestSubmission'
+          f1_score: '$bestEntry.f1',
+          accuracy: '$bestEntry.accuracy',
+          last_submission: '$bestEntry.timestamp'
         }
-      }
+      },
+      // Sort by f1 score descending
+      { $sort: { f1_score: -1, last_submission: 1 } },
+      { $limit: limit }
     ]);
    
     return res.status(200).json({
-      leaderboard,
+      leaderboard: bestScores,
       updated_at: new Date().toISOString()
     });
    
@@ -570,7 +651,7 @@ app.get('/leaderboard', async (req, res) => {
   }
 });
 
-// User scores endpoint - protected
+// FIXED User scores endpoint - protected
 app.get('/scores', authenticateJWT, async (req, res) => {
   try {
     const userId = req.user.username;
@@ -595,12 +676,15 @@ app.get('/scores', authenticateJWT, async (req, res) => {
     });
    
     const uploadsToday = userCount ? userCount.count : 0;
+    
+    // Fixed best F1 query
+    const bestScore = await Score.findOne({ userId }, {}, { sort: { f1: -1 } });
    
     return res.status(200).json({
       scores: userScores,
       stats: {
         total_submissions: await Score.countDocuments({ userId }),
-        best_f1: await Score.findOne({ userId }).sort({ f1: -1 }).then(doc => doc ? doc.f1 : null),
+        best_f1: bestScore ? bestScore.f1 : null,
         uploads_today: uploadsToday,
         uploads_remaining: MAX_DAILY_UPLOADS - uploadsToday
       }
@@ -655,13 +739,45 @@ app.get('/verify-token', authenticateJWT, (req, res) => {
   });
 });
 
-// Add this endpoint before the /upload route
+// Row count endpoint for client information
 app.get('/row-count', async (req, res) => {
   try {
-    res.status(200).json({ rowCount: IDEAL_DF.length });
+    res.status(200).json({ 
+      rowCount: IDEAL_DF.length,
+      expectedColumns: {
+        prediction: Object.keys(IDEAL_DF[0]).find(k => ['fraudlabel', 'isfraud'].includes(k.toLowerCase())),
+        transactionId: Object.keys(IDEAL_DF[0]).find(k => k.toLowerCase() === 'transactionid')
+      }
+    });
   } catch (error) {
     console.error('Error getting row count:', error);
     res.status(500).json({ error: 'Failed to get row count' });
+  }
+});
+
+// Endpoint to check expected format for uploads
+app.get('/upload-format', async (req, res) => {
+  try {
+    // Determine required columns from ideal dataset
+    const idealColumns = Object.keys(IDEAL_DF[0]);
+    const fraudColumn = idealColumns.find(k => ['fraudlabel', 'isfraud'].includes(k.toLowerCase()));
+    const transactionColumn = idealColumns.find(k => k.toLowerCase() === 'transactionid');
+    
+    res.status(200).json({
+      expectedFormat: {
+        required: fraudColumn || 'isFraud',
+        recommendedColumns: transactionColumn ? [transactionColumn, fraudColumn || 'isFraud'] : [fraudColumn || 'isFraud'],
+        validValues: [0, 1],
+        rowCount: IDEAL_DF.length,
+        example: {
+          [transactionColumn || 'TransactionID']: 'TX123456',
+          [fraudColumn || 'isFraud']: 1
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Error getting upload format:', error);
+    res.status(500).json({ error: 'Failed to get upload format information' });
   }
 });
 
